@@ -23,9 +23,9 @@ class SingleHeadAttention(nn.Module):
         k = self.key(embedded)
         q = self.query(embedded)
         v = self.value(embedded)
-        qk = q @ k.transpose(-2,-1)/(k.shape[2]**(0.5))
-        qk = torch.tril(qk)
-        qk[qk==0] = float('-inf')
+        qk = q @ k.transpose(-2,-1)/(k.shape[-1]**(0.5))
+        mask = torch.tril(torch.ones_like(qk,dtype=torch.bool))
+        qk = qk.masked_fill(~mask,float('-inf'))
         qk = torch.softmax(qk,dim=2)
         att = qk @ v
         return torch.round(att,decimals=4)
