@@ -1,0 +1,5 @@
+# Colab already supplies a CUDA-enabled PyTorch build. Do not reinstall torch
+# unless you deliberately need a particular runtime version.
+datasets>=3.0.0
+tokenizers>=0.20.0
+matplotlib>=3.8.0
