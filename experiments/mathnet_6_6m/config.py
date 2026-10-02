@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -18,12 +18,31 @@ class ModelConfig:
     intermediate_size: int = 960
     dropout: float = 0.10
     bias: bool = False
+    attention_type: Literal["mha", "gqa"] = "mha"
+    num_kv_heads: int | None = None
+    normalization: Literal["rmsnorm", "layernorm"] = "rmsnorm"
+    norm_position: Literal["pre", "post"] = "pre"
 
     def __post_init__(self) -> None:
         if self.n_embd % self.n_head != 0:
             raise ValueError("n_embd must be divisible by n_head")
         if (self.n_embd // self.n_head) % 2 != 0:
             raise ValueError("head dimension must be even for the chosen architecture")
+        if self.attention_type not in {"mha", "gqa"}:
+            raise ValueError("attention_type must be 'mha' or 'gqa'")
+        if self.normalization not in {"rmsnorm", "layernorm"}:
+            raise ValueError("normalization must be 'rmsnorm' or 'layernorm'")
+        if self.norm_position not in {"pre", "post"}:
+            raise ValueError("norm_position must be 'pre' or 'post'")
+        kv_heads = self.resolved_num_kv_heads
+        if self.n_head % kv_heads != 0:
+            raise ValueError("n_head must be divisible by num_kv_heads")
+        if self.attention_type == "mha" and kv_heads != self.n_head:
+            raise ValueError("MHA must use one key/value head per query head")
+
+    @property
+    def resolved_num_kv_heads(self) -> int:
+        return self.n_head if self.num_kv_heads is None else self.num_kv_heads
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

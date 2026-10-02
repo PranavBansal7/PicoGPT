@@ -15,17 +15,17 @@ import math
 import random
 import shutil
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from .config import DEFAULT_MODEL_CONFIG, TrainConfig
+from .config import ModelConfig, TrainConfig
 from .model import MathNetGPT
+from .variants import VARIANT_DESCRIPTIONS, get_variant
 
 
 class TokenStore:
@@ -96,7 +96,6 @@ class MetricWriter:
         self.handle.close()
 
     def to_csv(self, destination: Path) -> None:
-        self.handle.flush()
         rows = [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines()]
         fields = sorted({key for row in rows for key in row})
         with destination.open("w", newline="", encoding="utf-8") as handle:
@@ -140,12 +139,13 @@ def make_scaler(enabled: bool) -> Any:
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def learning_rate(step: int, config: TrainConfig) -> float:
+def learning_rate(step: int, config: TrainConfig, schedule_total_steps: int | None = None) -> float:
+    total_steps = config.total_steps if schedule_total_steps is None else schedule_total_steps
     if step < config.warmup_steps:
         return config.learning_rate * (step + 1) / config.warmup_steps
-    if step >= config.total_steps - 1:
+    if step >= total_steps - 1:
         return config.min_learning_rate
-    decay_ratio = (step - config.warmup_steps) / max(1, config.total_steps - config.warmup_steps)
+    decay_ratio = (step - config.warmup_steps) / max(1, total_steps - config.warmup_steps)
     cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(decay_ratio, 0.0), 1.0)))
     return config.min_learning_rate + cosine * (config.learning_rate - config.min_learning_rate)
 
@@ -168,6 +168,7 @@ def evaluate(
     generator = torch.Generator(device="cpu").manual_seed(seed)
     weighted_loss = 0.0
     tokens_seen = 0
+    correct_tokens = 0
     for _ in range(batches):
         x, y = token_store.batch(split, micro_batch_size, device, generator)
         with autocast_context(device, amp_dtype):
@@ -176,10 +177,16 @@ def evaluate(
         token_count = y.numel()
         weighted_loss += loss.float().item() * token_count
         tokens_seen += token_count
+        correct_tokens += (logits.argmax(dim=-1) == y).sum().item()
     if was_training:
         model.train()
     mean_loss = weighted_loss / tokens_seen
-    return {"loss": mean_loss, "perplexity": math.exp(min(mean_loss, 20.0)), "tokens": float(tokens_seen)}
+    return {
+        "loss": mean_loss,
+        "perplexity": math.exp(min(mean_loss, 20.0)),
+        "top1_accuracy": correct_tokens / tokens_seen,
+        "tokens": float(tokens_seen),
+    }
 
 
 def save_checkpoint(
@@ -192,6 +199,7 @@ def save_checkpoint(
     global_step: int,
     best_validation_loss: float,
     run_config: dict[str, Any],
+    train_generator: torch.Generator,
 ) -> None:
     payload = {
         "model_state_dict": model.state_dict(),
@@ -203,6 +211,7 @@ def save_checkpoint(
         "run_config": run_config,
         "cpu_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "train_generator_state": train_generator.get_state(),
     }
     torch.save(payload, path)
 
@@ -214,14 +223,30 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: Any,
     device: torch.device,
+    train_generator: torch.Generator,
 ) -> tuple[int, int, float]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    saved_config = checkpoint.get("run_config", {}).get("model")
+    if saved_config is not None:
+        restored_config = ModelConfig(**saved_config).to_dict()
+        if restored_config != model.export_config():
+            raise ValueError(
+                "The checkpoint architecture does not match the selected --variant. "
+                "Resume only with the variant that created the checkpoint."
+            )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
-    torch.set_rng_state(checkpoint["cpu_rng_state"])
-    if device.type == "cuda" and checkpoint.get("cuda_rng_state_all") is not None:
-        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+    try:
+        torch.set_rng_state(checkpoint["cpu_rng_state"])
+        if device.type == "cuda" and checkpoint.get("cuda_rng_state_all") is not None:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+        train_generator.set_state(checkpoint["train_generator_state"])
+    except (KeyError, RuntimeError, TypeError) as error:
+        raise RuntimeError(
+            "This checkpoint lacks compatible RNG state for an exact resume. "
+            "Start a new run or use a checkpoint written by the current trainer."
+        ) from error
     return (
         int(checkpoint["epoch_completed"]),
         int(checkpoint["global_step"]),
@@ -246,6 +271,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=13_337)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--resume", type=Path, help="Resume from a checkpoint written by this script.")
+    parser.add_argument(
+        "--schedule-total-steps",
+        type=int,
+        help="Total updates for cosine decay; set this when extending a resumed run.",
+    )
+    parser.add_argument("--variant", choices=tuple(VARIANT_DESCRIPTIONS), default="pre_rms_mha")
     return parser.parse_args()
 
 
@@ -263,7 +294,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         eval_batches=args.eval_batches,
         seed=args.seed,
     )
-    if train_config.total_steps <= train_config.warmup_steps:
+    schedule_total_steps = train_config.total_steps if args.schedule_total_steps is None else args.schedule_total_steps
+    if schedule_total_steps <= train_config.warmup_steps:
         raise ValueError("total steps must exceed warmup steps")
     set_seed(train_config.seed)
     device, amp_dtype = choose_device(args.device)
@@ -274,7 +306,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     if not data_metadata_path.exists():
         raise FileNotFoundError("Prepare MathNet data before training (data_metadata.json is missing).")
     data_metadata = json.loads(data_metadata_path.read_text(encoding="utf-8"))
-    if data_metadata["tokenizer"]["vocab_size"] != DEFAULT_MODEL_CONFIG.vocab_size:
+    model_config = get_variant(args.variant)
+    if data_metadata["tokenizer"]["vocab_size"] != model_config.vocab_size:
         raise ValueError("Prepared tokenizer vocabulary does not match the fixed 6.622M model config.")
     for artifact_name in ("data_metadata.json", "split_manifest.jsonl", "tokenizer.json"):
         artifact_path = args.data_dir / artifact_name
@@ -282,8 +315,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             raise FileNotFoundError(f"Prepared data artifact is missing: {artifact_path}")
         shutil.copy2(artifact_path, args.run_dir / artifact_name)
 
-    model = MathNetGPT(DEFAULT_MODEL_CONFIG).to(device)
-    token_store = TokenStore(args.data_dir, DEFAULT_MODEL_CONFIG.block_size)
+    model = MathNetGPT(model_config).to(device)
+    token_store = TokenStore(args.data_dir, model_config.block_size)
     try:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -304,6 +337,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     run_config: dict[str, Any] = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "model": model.export_config(),
+        "variant": args.variant,
         "parameter_count": model.parameter_count,
         "training": train_config.to_dict(),
         "runtime": {
@@ -315,6 +349,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "data_directory": str(args.data_dir),
         "metric_interpretation": "Held-out next-token cross-entropy and exp(loss); not MathNet problem-solving accuracy.",
     }
+    run_config["training"]["learning_rate_schedule_total_steps"] = schedule_total_steps
     (args.run_dir / "run_config.json").write_text(
         json.dumps(run_config, indent=2), encoding="utf-8"
     )
@@ -322,13 +357,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     start_epoch = 0
     global_step = 0
     best_validation_loss = float("inf")
+    train_generator = torch.Generator(device="cpu").manual_seed(train_config.seed)
     if args.resume is not None:
         start_epoch, global_step, best_validation_loss = load_checkpoint(
-            args.resume, model=model, optimizer=optimizer, scaler=scaler, device=device
+            args.resume,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            train_generator=train_generator,
         )
 
     metrics = MetricWriter(args.run_dir)
-    train_generator = torch.Generator(device="cpu").manual_seed(train_config.seed)
     started_at = time.perf_counter()
     try:
         for epoch_index in range(start_epoch, train_config.epochs):
@@ -336,7 +376,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             epoch_loss_sum = 0.0
             epoch_tokens = 0
             for step_in_epoch in range(1, train_config.steps_per_epoch + 1):
-                lr = learning_rate(global_step, train_config)
+                lr = learning_rate(global_step, train_config, schedule_total_steps)
                 for parameter_group in optimizer.param_groups:
                     parameter_group["lr"] = lr
                 optimizer.zero_grad(set_to_none=True)
@@ -362,7 +402,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
                 update_loss = update_loss_sum / train_config.gradient_accumulation_steps
                 update_tokens = (
-                    train_config.effective_batch_size * DEFAULT_MODEL_CONFIG.block_size
+                    train_config.effective_batch_size * model_config.block_size
                 )
                 epoch_loss_sum += update_loss * update_tokens
                 epoch_tokens += update_tokens
@@ -401,6 +441,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 "train_perplexity": math.exp(min(epoch_train_loss, 20.0)),
                 "validation_loss": validation["loss"],
                 "validation_perplexity": validation["perplexity"],
+                "validation_top1_accuracy": validation["top1_accuracy"],
                 "validation_tokens": int(validation["tokens"]),
                 "elapsed_seconds": time.perf_counter() - started_at,
             }
@@ -415,6 +456,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 global_step=global_step,
                 best_validation_loss=min(best_validation_loss, validation["loss"]),
                 run_config=run_config,
+                train_generator=train_generator,
             )
             if validation["loss"] < best_validation_loss:
                 best_validation_loss = validation["loss"]
@@ -427,6 +469,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     global_step=global_step,
                     best_validation_loss=best_validation_loss,
                     run_config=run_config,
+                    train_generator=train_generator,
                 )
             if (epoch_index + 1) % 5 == 0:
                 save_checkpoint(
@@ -438,6 +481,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     global_step=global_step,
                     best_validation_loss=best_validation_loss,
                     run_config=run_config,
+                    train_generator=train_generator,
                 )
 
         # Save a compact inference-only artifact in addition to resumable state.

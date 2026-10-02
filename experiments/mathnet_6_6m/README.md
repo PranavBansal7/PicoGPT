@@ -88,3 +88,10 @@ python -m unittest experiments.mathnet_6_6m.test_model
 This verifies the exact parameter count, cached-vs-full logits, and cached
 generation shape. The end-of-run evaluator repeats the cache logit check and
 writes the outcome alongside the internal held-out next-token loss/perplexity.
+
+## Compare optimization variants
+
+See [ABLATIONS.md](ABLATIONS.md) for a parameter-matched Pre-LN, RMSNorm, MHA,
+and GQA study, plus a separate cache-off/cache-on decoding benchmark. KV cache
+is an inference optimization and should be compared on latency, throughput, and
+memory—not on accuracy, because correct cached and uncached decoding is equal.

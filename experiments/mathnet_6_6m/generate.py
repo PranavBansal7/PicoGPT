@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from tokenizers import Tokenizer
 
-from .config import DEFAULT_MODEL_CONFIG
+from .config import DEFAULT_MODEL_CONFIG, ModelConfig
 from .model import MathNetGPT
 from .train import choose_device
 
@@ -39,8 +39,10 @@ def main(args: argparse.Namespace) -> None:
         raise FileNotFoundError("A best checkpoint and copied tokenizer.json are required.")
     torch.manual_seed(args.seed)
     device, _ = choose_device(args.device)
-    model = MathNetGPT(DEFAULT_MODEL_CONFIG).to(device).eval()
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_config = checkpoint.get("run_config", {}).get("model")
+    model_config = DEFAULT_MODEL_CONFIG if checkpoint_config is None else ModelConfig(**checkpoint_config)
+    model = MathNetGPT(model_config).to(device).eval()
     model.load_state_dict(checkpoint["model_state_dict"])
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     sections = [

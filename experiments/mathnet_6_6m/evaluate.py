@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from .config import DEFAULT_MODEL_CONFIG
+from .config import DEFAULT_MODEL_CONFIG, ModelConfig
 from .model import MathNetGPT
 from .train import TokenStore, choose_device, evaluate
 
@@ -72,10 +72,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "delete it only if you are explicitly re-running the experiment."
         )
     device, amp_dtype = choose_device(args.device)
-    model = MathNetGPT(DEFAULT_MODEL_CONFIG).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint_config = checkpoint.get("run_config", {}).get("model")
+    model_config = DEFAULT_MODEL_CONFIG if checkpoint_config is None else ModelConfig(**checkpoint_config)
+    model = MathNetGPT(model_config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    token_store = TokenStore(args.data_dir, DEFAULT_MODEL_CONFIG.block_size)
+    token_store = TokenStore(args.data_dir, model_config.block_size)
     metrics = evaluate(
         model,
         token_store,
@@ -92,11 +94,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint["epoch_completed"],
         "checkpoint_global_step": checkpoint["global_step"],
+        "variant": checkpoint.get("run_config", {}).get("variant", "pre_rms_mha"),
         "metric_scope": "PicoGPT MathNet-v0 internal held-out next-token LM test; not MathNet-Solve accuracy.",
         "test_batches": args.test_batches,
         "micro_batch_size": args.micro_batch_size,
         "test_loss": metrics["loss"],
         "test_perplexity": metrics["perplexity"],
+        "test_top1_accuracy": metrics["top1_accuracy"],
         "test_tokens": int(metrics["tokens"]),
         "kv_cache_check": cache_check,
     }
@@ -109,6 +113,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "status": "complete",
                 "test_loss": result["test_loss"],
                 "test_perplexity": result["test_perplexity"],
+                "test_top1_accuracy": result["test_top1_accuracy"],
                 "test_tokens": result["test_tokens"],
                 "kv_cache_check": cache_check,
             }

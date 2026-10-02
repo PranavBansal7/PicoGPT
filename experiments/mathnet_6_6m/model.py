@@ -39,6 +39,22 @@ class RMSNorm(nn.Module):
         return normalized * self.weight.to(dtype=input_dtype)
 
 
+class LayerNormNoBias(nn.Module):
+    """LayerNorm with only a learned scale, matching RMSNorm's parameter count."""
+
+    def __init__(self, width: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(width))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, (x.shape[-1],), self.weight.to(dtype=x.dtype), None, self.eps)
+
+
+def build_norm(config: ModelConfig) -> nn.Module:
+    return RMSNorm(config.n_embd) if config.normalization == "rmsnorm" else LayerNormNoBias(config.n_embd)
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate adjacent feature pairs, as used by rotary positional embeddings."""
     x = x.view(*x.shape[:-1], -1, 2)
@@ -121,6 +137,65 @@ class CausalSelfAttention(nn.Module):
         return self.resid_dropout(self.c_proj(y)), present
 
 
+class GroupedQueryAttention(nn.Module):
+    """Causal GQA that stores only compact key/value heads in its cache."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_kv_head = config.resolved_num_kv_heads
+        self.head_dim = config.n_embd // config.n_head
+        self.dropout = config.dropout
+        self.rope = RotaryEmbedding(self.head_dim)
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        kv_width = self.n_kv_head * self.head_dim
+        self.k_proj = nn.Linear(config.n_embd, kv_width, bias=config.bias)
+        self.v_proj = nn.Linear(config.n_embd, kv_width, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_value: Optional[PastKeyValue] = None,
+        *,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, Optional[PastKeyValue]]:
+        batch_size, tokens, channels = x.shape
+        q = self.q_proj(x).view(batch_size, tokens, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, tokens, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, tokens, self.n_kv_head, self.head_dim).transpose(1, 2)
+        q, k = self.rope(q, k, positions)
+
+        past_length = 0
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            if past_k.shape[:2] != (batch_size, self.n_kv_head):
+                raise ValueError("GQA KV cache batch size or KV head count does not match input")
+            past_length = past_k.size(2)
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+
+        # Keep the cache compact; only expand K/V for this attention operation.
+        group_size = self.n_head // self.n_kv_head
+        expanded_k = k.repeat_interleave(group_size, dim=1)
+        expanded_v = v.repeat_interleave(group_size, dim=1)
+        dropout_p = self.dropout if self.training else 0.0
+        if past_length == 0:
+            y = F.scaled_dot_product_attention(q, expanded_k, expanded_v, dropout_p=dropout_p, is_causal=True)
+        else:
+            total_tokens = past_length + tokens
+            causal_mask = torch.ones(tokens, total_tokens, dtype=torch.bool, device=x.device)
+            causal_mask = torch.tril(causal_mask, diagonal=past_length)
+            y = F.scaled_dot_product_attention(
+                q, expanded_k, expanded_v, attn_mask=causal_mask, dropout_p=dropout_p
+            )
+        y = y.transpose(1, 2).contiguous().view(batch_size, tokens, channels)
+        present = (k, v) if use_cache else None
+        return self.resid_dropout(self.c_proj(y)), present
+
+
 class MLP(nn.Module):
     """A compact GELU feed-forward sublayer."""
 
@@ -140,10 +215,13 @@ class Block(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.rms_1 = RMSNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.rms_2 = RMSNorm(config.n_embd)
+        # Keep the original attribute names so default-MHA checkpoints remain
+        # loadable; the modules may be RMSNorm or LayerNormNoBias by variant.
+        self.rms_1 = build_norm(config)
+        self.attn = CausalSelfAttention(config) if config.attention_type == "mha" else GroupedQueryAttention(config)
+        self.rms_2 = build_norm(config)
         self.mlp = MLP(config)
+        self.norm_position = config.norm_position
 
     def forward(
         self,
@@ -153,11 +231,16 @@ class Block(nn.Module):
         *,
         use_cache: bool = False,
     ) -> tuple[torch.Tensor, Optional[PastKeyValue]]:
-        attention_output, present = self.attn(
-            self.rms_1(x), positions, past_key_value, use_cache=use_cache
-        )
-        x = x + attention_output
-        x = x + self.mlp(self.rms_2(x))
+        if self.norm_position == "pre":
+            attention_output, present = self.attn(
+                self.rms_1(x), positions, past_key_value, use_cache=use_cache
+            )
+            x = x + attention_output
+            x = x + self.mlp(self.rms_2(x))
+        else:
+            attention_output, present = self.attn(x, positions, past_key_value, use_cache=use_cache)
+            x = self.rms_1(x + attention_output)
+            x = self.rms_2(x + self.mlp(x))
         return x, present
 
 
@@ -170,7 +253,7 @@ class MathNetGPT(nn.Module):
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.rms_f = RMSNorm(config.n_embd)
+        self.rms_f = build_norm(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)

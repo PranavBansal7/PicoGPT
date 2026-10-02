@@ -50,10 +50,12 @@ def make_results_markdown(
     dataset = data_metadata["dataset"]
     test_loss = test.get("test_loss") if test else None
     test_ppl = test.get("test_perplexity") if test else None
+    test_top1 = test.get("test_top1_accuracy") if test else None
     test_tokens = test.get("test_tokens") if test else "—"
     cache = "passed" if test and test["kv_cache_check"]["passed"] else "not run"
     completed_steps = summary.get("optimizer_steps_completed")
     completed_steps_display = f"{completed_steps:,}" if isinstance(completed_steps, int) else "—"
+    best_epoch = min(load_epoch_rows(Path(run_config["metrics_path"])), key=lambda row: row["validation_loss"])
     return f'''# PicoGPT — MathNet 6.62M experiment
 
 This is a self-contained scaled experiment. It does **not** modify or import
@@ -109,9 +111,11 @@ deterministic internal 80/10/10 splits; they are not MathNet-Solve partitions.
 |---|---:|
 | Best validation loss | {_number(summary.get('best_validation_loss'))} |
 | Best validation perplexity | {_number(summary.get('best_validation_perplexity'))} |
+| Best validation top-1 token accuracy | {_number(best_epoch.get('validation_top1_accuracy'))} |
 | Completed optimizer updates | {completed_steps_display} |
 | Internal held-out test loss | {_number(test_loss)} |
 | Internal held-out test perplexity | {_number(test_ppl)} |
+| Internal held-out test top-1 token accuracy | {_number(test_top1)} |
 | Test tokens evaluated | {test_tokens} |
 | KV-cache validation | {cache} |
 
@@ -136,6 +140,7 @@ def main(run_dir: Path) -> None:
         raise RuntimeError("No epoch_summary records found; train before creating a report.")
     make_plot(rows, run_dir / "loss_perplexity.png")
     config = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+    config["metrics_path"] = str(run_dir / "metrics.jsonl")
     data_metadata = json.loads((run_dir / "data_metadata.json").read_text(encoding="utf-8"))
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     test_path = run_dir / "test_results.json"
