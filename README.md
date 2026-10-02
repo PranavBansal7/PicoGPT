@@ -1,145 +1,147 @@
 # PicoGPT
 
-A GPT, built upward from a single neuron — no transformers library, no borrowed layers, no black boxes.
+PicoGPT is a from-scratch GPT learning project with two deliberately separate
+tracks:
 
-**Pico** for the scale this runs at: an ~800K-parameter, character-level model built module by module rather than imported, small enough to train on a laptop CPU while every piece — attention, GQA, KV-cache, RMSNorm, and the training loop itself — is something you derived and can verify by hand.
+- A compact, character-level tiny-Shakespeare model that makes each
+  transformer primitive inspectable.
+- An isolated 6.62M-parameter MathNet experiment for reproducible,
+  GPU-backed language-model training, evaluation, ablations, and cached
+  decoding.
 
-## Overview
+The MathNet code never imports or changes the original teaching model. The
+smaller project therefore remains a useful, readable path from neuron to GPT,
+while the experiment can evolve without invalidating it.
 
-This repository traces the full arc of a decoder-only transformer, one primitive at a time:
+## What is in the repository
 
-**neuron → backprop → MLP → tokenizer → embeddings → attention → transformer block → GPT → training loop → generation → modern scaling tricks (RMSNorm, GQA, KV-caching)**
-
-Each stage is its own tested, self-contained module rather than a single monolithic script. That structure was a deliberate choice: it forces every layer's forward and backward behavior to be understood well enough to reproduce exactly. Modules are seeded for deterministic, checkable output, making this a different exercise from simply calling `nn.MultiheadAttention` and moving on.
-
-## Highlights
-
-- **Manual backprop** — hand-derived gradients for a single neuron and a 2-layer MLP (`foundations/backprop.py`, `foundations/multi_layer_backprop.py`) before relying on autograd.
-- **Byte-Pair Encoding from scratch** — a first-principles BPE merge algorithm (`data/tokenizer.py`), alongside a character-level vocabulary/encode/decode pipeline (`data/vocab.py`).
-- **Attention, three ways** — single-head causal attention → multi-head attention → Grouped Query Attention (GQA), the mechanism used in modern LLMs such as LLaMA and Mistral.
-- **KV-caching** — incremental key/value caching for autoregressive decoding, avoiding recomputation of previous K/V projections.
-- **Three normalization schemes** — LayerNorm, BatchNorm (including running-stat train/inference modes), and RMSNorm.
-- **A full Pre-LN GPT** — sinusoidal positional encoding, residual transformer blocks, AdamW training, and multinomial autoregressive sampling, assembled into a working character-level language model.
-
-## Project structure
-
-```text
+~~~text
 .
-├── foundations/         # ML primitives, built before transformer code
-│   ├── neuron.py, activations.py, loss.py, softmax.py
-│   ├── gradient_descent.py, linear_regression.py, linear_regression_training.py
-│   ├── backprop.py, multi_layer_backprop.py, mlp.py, weight_init.py
-│   ├── digit_classifier.py, sentiment.py, pytorch_basics.py
-│   └── dead_relu_detector.py, training_diagnostics.py
-│
-├── data/                # Tokenization and batching
-│   ├── vocab.py             # char-level stoi/itos, encode/decode
-│   ├── tokenizer.py         # BPE merge learning from raw corpus
-│   ├── tokenizer_utils.py   # greedy tokenization + fertility-score analysis
-│   ├── dataset.py, loader.py
-│   └── nlp_preprocessing.py
-│
-├── model/               # Transformer components
-│   ├── embeddings.py, positional_encoding.py
-│   ├── attention.py             # single-head causal self-attention
-│   ├── multi_head_attention.py  # multi-head self-attention
-│   ├── grouped_query_attention.py # GQA
-│   ├── kv_cache.py              # incremental K/V cache
-│   ├── normalization.py, batch_normalization.py, rms_normalization.py
-│   ├── transformer.py            # Pre-LN transformer block
-│   └── gpt.py                    # full GPT model
-│
-├── train.py             # AdamW + cross-entropy training loop
-├── generate.py          # autoregressive sampling
-└── requirements.txt
-```
+├── foundations/                  # ML primitives and manual-backprop exercises
+├── data/                         # character vocabulary, BPE, and batching
+├── model/                        # original attention, transformer, and GPT modules
+├── train.py, generate.py         # original tiny-Shakespeare workflow
+└── experiments/mathnet_6_6m/     # standalone 6.62M MathNet experiment
+    ├── prepare_data.py           # pinned source data and deterministic split
+    ├── model.py                  # RoPE, MHA/GQA, RMSNorm/LayerNorm, KV cache
+    ├── train.py, evaluate.py     # resumable training and held-out LM evaluation
+    ├── benchmark_decode.py       # cache-off/cache-on decoding benchmark
+    ├── chat.py                   # EOS-aware problem-to-solution interface
+    └── ABLATIONS.md              # protocol and recorded experiment status
+~~~
 
-## Training: tiny-Shakespeare
+## Original teaching model
 
-The model was trained character-by-character on **tiny-Shakespeare** (about 1.11M characters, vocabulary size 65).
+The original track builds a decoder-only GPT from individual, tested pieces:
 
-Configuration:
+**neuron → backprop → MLP → tokenizer → embeddings → attention → transformer
+block → GPT → training loop → generation**
 
-| Setting | Value |
+It includes hand-derived gradients, BPE, causal and multi-head attention,
+Grouped Query Attention, a KV cache, LayerNorm/BatchNorm/RMSNorm, AdamW
+training, and autoregressive sampling. The original tiny-Shakespeare example
+uses an approximately 816K-parameter character model.
+
+The fixed-precision output rounding in model/gpt.py is useful for the original
+numerical tests but prevents meaningful gradients. Keep it for those
+deterministic test outputs; skip it for real training.
+
+## MathNet experiment: current status
+
+The MathNet work is a **text-only next-token language-model experiment**, not
+a MathNet-Solve accuracy result. It uses ShadenA/MathNet revision
+33e6b3bc254e6f0f0c1479b4252f5e9dd551d56c, replaces attached-image Markdown
+with the image sentinel token, and creates a deterministic provenance-grouped
+internal 80/10/10 split. Its held-out partitions are not official benchmark
+splits.
+
+Prepared data provenance:
+
+| Item | Value |
 |---|---:|
-| Parameters | ~816K |
-| Blocks | 4 |
-| Attention heads | 4 |
-| Model dimension | 128 |
-| Context length | 64 |
-| Batch size | 16 |
-| Optimizer | AdamW |
-| Learning rate | 3e-4 |
-| Device | CPU |
-| Training steps | 1,950 |
-| Initial loss | 4.29 nats/token |
-| Final loss | 1.93 nats/token |
-| Training time | ~170 seconds |
+| Source rows loaded | 27,817 |
+| Documents: train / validation / test | 19,934 / 2,662 / 1,686 |
+| Tokens: train / validation / test | 12,851,747 / 1,906,401 / 1,213,495 |
+| Tokenizer | 8,192-token byte-level BPE trained on train only |
+| Trainable parameters per ablation variant | 6,622,464 |
 
-### Training loss
+### Completed long reference run
 
-![PicoGPT training loss](training_loss.png)
+A completed reference continuation reached 16,100 optimizer updates on a Tesla
+T4 with bfloat16. It is a useful language-model checkpoint, but its older
+run configuration does not record the later variant field, so it must **not**
+be used to rank the ablation variants.
 
-The loss fell by roughly **55%** from initialization, from **4.29** to **1.93 nats/token** over 1,950 steps. The initial loss is close to the random-guess baseline `ln(65) ≈ 4.17`. At ~2K CPU steps, the model has learned substantial character and whitespace statistics, while coherent long-form generation is still limited — expected for a model this small and training run this short.
+| Metric | Recorded result |
+|---|---:|
+| Best validation loss / perplexity | 1.84157 / 6.30644 |
+| Internal held-out test loss / perplexity | 1.87108 / 6.49528 |
+| Test tokens evaluated | 2,048,000 |
+| KV-cache logit check | passed; max absolute error 1.91e-05 (tolerance 2e-04) |
 
-## Quickstart
+### Completed single-seed comparison
 
-The modules are composable units rather than a CLI, so a full train → generate loop looks like:
+Both rows below use seed 1337, 4,100 updates, the same prepared split,
+sequence length, optimizer schedule, and 6,622,464-parameter budget. This is
+an informative **single-seed observation**, not a multi-seed conclusion and
+not evidence that GQA alone caused the difference: normalization and attention
+change together between these variants.
 
-```python
-import torch
-from model.gpt import GPT
-from data.vocab import Solution as Vocab
-from train import Solution as Trainer
-from generate import Solution as Generator
+| Variant | Best validation loss | Test loss | Test perplexity | Test top-1 token accuracy |
+|---|---:|---:|---:|---:|
+| Post-LN LayerNorm + MHA | 2.34068 | 2.34940 | 10.47929 | 0.47370 |
+| Pre-LN RMSNorm + 8Q/2KV GQA | 2.22066 | 2.23694 | 9.36461 | 0.49612 |
 
-# 1. Build a character-level vocabulary from any text file
-text = open("corpus.txt").read()
-stoi, itos = Vocab().build_vocab(text)
-data = torch.tensor(Vocab().encode(text, stoi))
+Each run evaluated 2,048,000 internal held-out tokens and passed the
+cached-vs-full logit check with a maximum absolute error of 1.24e-05.
+Pre-LN LayerNorm, Pre-LN RMSNorm + MHA, and the remaining seeds are still
+needed before reporting a mean, standard deviation, or a preferred variant.
 
-# 2. Instantiate the model
-model = GPT(
-    vocab_size=len(stoi),
-    context_length=64,
-    model_dim=128,
-    num_blocks=4,
-    num_heads=4,
-)
+### KV-cache benchmark
 
-# 3. Train
-final_loss = Trainer().train(
-    model, data, epochs=500, context_length=64, batch_size=16, lr=3e-4
-)
-print(f"final loss: {final_loss}")
+The archived Pre-LN RMSNorm + GQA checkpoint was decoded for 128 new tokens on
+a Tesla T4 over ten trials. Cache-on and cache-off greedy tokens matched in
+every benchmark. The figures below are measured, not estimates.
 
-# 4. Generate
-context = torch.zeros((1, 1), dtype=torch.long)
-sample = Generator().generate(
-    model, new_chars=200, context=context, context_length=64, int_to_char=itos
-)
-print(sample)
-```
+| Prompt tokens | Cache-off median | Cache-on median | Cache-on/off speed | Additional peak memory: off → on |
+|---|---:|---:|---:|---:|
+| 32 | 0.8314 s | 0.9372 s | 0.887× | 11.30 MB → 1.35 MB |
+| 128 | 0.8427 s | 0.9315 s | 0.905× | 17.21 MB → 5.26 MB |
+| 256 | 0.7970 s | 0.7989 s | 0.998× | 17.31 MB → 18.88 MB |
 
-## Important implementation note
+For this small model and benchmark harness, caching proved correctness and
+lower short-prompt additional memory, but it did **not** produce a latency
+speedup. Treat cache performance as workload-dependent; do not generalize
+these numbers to a larger model or another device.
 
-`GPT.forward()` originally ends with `torch.round(x, decimals=4)`, which is useful for the fixed-precision numerical tests this project was built around, but it destroys gradients through the rounded tensor. Calling the committed training path without bypassing that rounding will therefore not produce a meaningful optimization run.
+## Reproducibility artifacts
 
-For training, the final rounding must be skipped; it can remain enabled for deterministic inference/test outputs. A planned cleanup is to expose this explicitly as `round_output=False` during training.
+The source code lives here; generated datasets, checkpoints, metrics, and
+reports are kept out of Git. The shared
+[PicoGPT_MathNet Drive folder](https://drive.google.com/drive/folders/1p3RGG7HFzLCC6nLq5nVs9rKWHvk538Tf?usp=sharing)
+contains prepared data and run directories. Its 1.39 GB
+pico_session_export.tar.gz archive includes the completed seed-1337 Post-LN
+and GQA runs plus the three decode benchmarks. Archive SHA-256:
 
-## Design philosophy
+~~~text
+a94cf611e4bee7f3ab33a68a34444f74f8d78e99a1fbdae83d002cf70cefb25d
+~~~
 
-Every `__init__` and `forward` is deliberately explicit about its computation. The foundational modules use pure NumPy or minimal PyTorch where possible, while the transformer components use `torch.nn.Module` without outsourcing the architecture to a transformers library.
+See experiments/mathnet_6_6m/README.md for the full protocol and
+experiments/mathnet_6_6m/ABLATIONS.md for the exact comparison boundaries.
 
-The goal is not to reproduce a production-scale LLM. The goal is to make the entire stack small enough that the mechanics of a GPT can be inspected, derived, tested, and understood end-to-end.
+## Quick start
 
-## Roadmap
+For the original learning modules, install the repository dependencies, build
+a character vocabulary from a corpus, create model.gpt.GPT, and use train.py
+plus generate.py. The modules are intentionally composable rather than hidden
+behind a large framework.
 
-- [ ] Add a `round_output=False` path to `GPT.forward()` so training does not require an external workaround.
-- [ ] Wire GQA + KV-cache into `gpt.py` as an inference-time fast path.
-- [ ] Add a small CLI (`python -m picogpt.train --corpus ...`).
-- [ ] Replace sinusoidal positional encoding with RoPE.
-- [ ] Add unit tests independent of the fixed-seed grading harness.
+For the MathNet experiment, open
+experiments/mathnet_6_6m/mathnet_6_6m_colab.ipynb in a GPU runtime and follow
+the cells in order. The notebook prepares the pinned data, writes all run
+artifacts to the selected Drive directory, and can resume from checkpoints
+written by the current experiment trainer.
 
 ## License
 
