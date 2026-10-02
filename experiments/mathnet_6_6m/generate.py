@@ -45,6 +45,9 @@ def main(args: argparse.Namespace) -> None:
     model = MathNetGPT(model_config).to(device).eval()
     model.load_state_dict(checkpoint["model_state_dict"])
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    eos_token_id = tokenizer.token_to_id("<|eos|>")
+    if eos_token_id is None:
+        raise ValueError("The saved tokenizer has no <|eos|> token.")
     sections = [
         "# Generated samples\n",
         f"Generated at {datetime.now(timezone.utc).isoformat()} from `{checkpoint_path.name}`. "
@@ -57,6 +60,7 @@ def main(args: argparse.Namespace) -> None:
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            eos_token_id=eos_token_id,
         )[0].tolist()
         generated = tokenizer.decode(generated_ids, skip_special_tokens=False)
         sections.extend([f"## Sample {index}\n", "```text\n", generated, "\n```\n"])

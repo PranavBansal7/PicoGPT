@@ -95,3 +95,29 @@ See [ABLATIONS.md](ABLATIONS.md) for a parameter-matched Pre-LN, RMSNorm, MHA,
 and GQA study, plus a separate cache-off/cache-on decoding benchmark. KV cache
 is an inference optimization and should be compared on latency, throughput, and
 memory—not on accuracy, because correct cached and uncached decoding is equal.
+
+## Talk to a trained PicoGPT
+
+The prepared corpus includes `<|bos|>`, `<|problem|>`, `<|solution|>`, and
+`<|eos|>` tokens. Generation now stops when it samples `<|eos|>`, or at the
+configured token limit if EOS is not sampled.
+
+After a Colab run has created `checkpoints/best.pt` and `tokenizer.json`, use a
+terminal for an interactive mathematical-question session:
+
+```bash
+python -m experiments.mathnet_6_6m.chat \
+  --run-dir /content/drive/MyDrive/PicoGPT_MathNet/runs/pre_rms_mha_seed1337
+```
+
+For a single Colab-cell response, use `--question`:
+
+```bash
+python -m experiments.mathnet_6_6m.chat \
+  --run-dir /content/drive/MyDrive/PicoGPT_MathNet/runs/pre_rms_mha_seed1337 \
+  --question "Solve for x: 3x - 5 = 16."
+```
+
+This is a problem-to-solution model, not a chat-tuned assistant: it has no
+training data for conversational roles or reliable general knowledge, and its
+generated mathematical answers need verification.

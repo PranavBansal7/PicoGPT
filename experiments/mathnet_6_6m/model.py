@@ -312,13 +312,19 @@ class MathNetGPT(nn.Module):
         *,
         temperature: float = 0.8,
         top_k: Optional[int] = 50,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
-        """Autoregressively sample while reusing keys and values when possible."""
+        """Autoregressively sample while reusing keys and values when possible.
+
+        When ``eos_token_id`` is supplied, a batch-one generation ends as soon
+        as EOS is emitted. Larger batches stop once every sequence emits EOS.
+        """
         if temperature <= 0:
             raise ValueError("temperature must be positive")
         output = input_ids
         context = output[:, -self.config.block_size :]
         logits, cache = self(context, use_cache=True)
+        finished = torch.zeros(output.size(0), dtype=torch.bool, device=output.device)
         for _ in range(max_new_tokens):
             next_logits = logits[:, -1, :] / temperature
             if top_k is not None:
@@ -326,6 +332,10 @@ class MathNetGPT(nn.Module):
                 next_logits = next_logits.masked_fill(next_logits < values[:, [-1]], -torch.inf)
             next_token = torch.multinomial(F.softmax(next_logits, dim=-1), num_samples=1)
             output = torch.cat((output, next_token), dim=1)
+            if eos_token_id is not None:
+                finished |= next_token.squeeze(1).eq(eos_token_id)
+                if bool(finished.all()):
+                    break
 
             # Once the cache would exceed its learned position range, rebuild it
             # from the most recent context window.  Otherwise decode one token.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -39,6 +40,21 @@ class MathNetGPTTests(unittest.TestCase):
         generated = self.model.generate(prompt, max_new_tokens=4, top_k=1)
         self.assertEqual(tuple(generated.shape), (1, 7))
         torch.testing.assert_close(generated[:, :3], prompt)
+
+    def test_generation_stops_after_eos(self) -> None:
+        prompt = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        eos_token_id = 7
+        with patch(
+            "experiments.mathnet_6_6m.model.torch.multinomial",
+            side_effect=lambda probabilities, num_samples: torch.full(
+                (probabilities.size(0), num_samples), eos_token_id, device=probabilities.device
+            ),
+        ):
+            generated = self.model.generate(
+                prompt, max_new_tokens=4, top_k=1, eos_token_id=eos_token_id
+            )
+        self.assertEqual(tuple(generated.shape), (1, 4))
+        self.assertEqual(generated[0, -1].item(), eos_token_id)
 
     def test_gqa_cache_matches_full_logits(self) -> None:
         model = MathNetGPT(get_variant("pre_rms_gqa")).eval()
