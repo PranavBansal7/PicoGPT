@@ -172,6 +172,58 @@ python -m experiments.mathnet_6_6m.chat \
 This is not a chat-tuned assistant. Its generated solution text may be wrong
 and requires independent verification.
 
+## Local terminal demo
+
+Use demo_chat.py when you want a simple, presentable back-and-forth terminal
+demo. It displays numbered turns and supports :help, :settings, :new, and
+:quit. It deliberately sends each entered question as a fresh
+problem-to-solution prompt: the model was not trained on conversational
+history, and keeping the conversation in the prompt would quickly exceed its
+256-token context window.
+
+### Windows / PowerShell
+
+This demo uses the completed 16,100-step reference checkpoint (internal held-out
+test loss 1.87108), not the 4,100-step GQA checkpoint in
+pico_session_export.tar.gz. From the
+[continue_from_8100 run folder](https://drive.google.com/drive/folders/1gIJkvkLA9CMM9Kkx26SWCHGMLq2xdNle),
+download only these two files:
+
+- checkpoints/best.pt
+- tokenizer.json
+
+Place them in a local demo_model directory with this structure:
+
+~~~text
+PicoGPT/
+└── demo_model/
+    ├── tokenizer.json
+    └── checkpoints/
+        └── best.pt
+~~~
+
+Then clone the repository and install the small local runtime:
+
+~~~powershell
+git clone https://github.com/PranavBansal7/PicoGPT.git
+cd PicoGPT
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+.\.venv\Scripts\python.exe -m pip install tokenizers
+.\.venv\Scripts\python.exe -m experiments.mathnet_6_6m.demo_chat --run-dir .\demo_model --device cpu --max-new-tokens 96
+~~~
+
+For a CUDA-capable local PyTorch installation, omit the CPU-only PyTorch
+command, install the build appropriate for your GPU from pytorch.org, and
+replace --device cpu with --device cuda. --device auto prefers CUDA when it is
+available.
+
+For a repeatable demo response, add --top-k 1. Otherwise, the default sampling
+settings provide a little variety between runs. Ask self-contained questions
+such as Solve for x: 3x - 5 = 16.; restate any information needed for a
+follow-up.
+
 ## Artifact bundle
 
 Generated artifacts are intentionally not committed. The shared

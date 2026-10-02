@@ -143,6 +143,14 @@ the cells in order. The notebook prepares the pinned data, writes all run
 artifacts to the selected Drive directory, and can resume from checkpoints
 written by the current experiment trainer.
 
+For an interactive local terminal demo using the completed 16,100-step
+reference checkpoint (internal held-out test loss 1.87108),
+follow the platform-specific commands in
+[experiments/mathnet_6_6m/README.md](experiments/mathnet_6_6m/README.md#local-terminal-demo).
+The demo_chat.py script provides a simple back-and-forth interface; it treats
+each entered question independently because the model is problem-to-solution
+trained rather than chat-trained.
+
 ## License
 
 MIT License
