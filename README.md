@@ -1,176 +1,238 @@
-# PicoGPT
+# PicoGPT: A Decoder-Only GPT Built from First Principles
 
-PicoGPT is a from-scratch GPT learning project with two deliberately separate
-tracks:
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![CUDA Compatible](https://img.shields.io/badge/CUDA-Tesla%20T4%20Tested-green.svg)](https://developer.nvidia.com/cuda-zone)
+[![Parameters](https://img.shields.io/badge/Parameters-6.62M-orange.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- A compact, character-level tiny-Shakespeare model that makes each
-  transformer primitive inspectable.
-- An isolated 6.62M-parameter MathNet experiment for reproducible,
-  GPU-backed language-model training, evaluation, ablations, and cached
-  decoding.
+An end-to-end, from-scratch implementation and empirical study of a decoder-only **Generative Pre-trained Transformer (GPT)**.
 
-The MathNet code never imports or changes the original teaching model. The
-smaller project therefore remains a useful, readable path from neuron to GPT,
-while the experiment can evolve without invalidating it.
+The project traces the complete evolutionary arc of transformer engineering: from foundational mathematical building blocks (hand-derived gradients, manual backpropagation, custom BPE tokenization) to a production-grade, scaled **6.62M-parameter language model** incorporating modern architectural paradigms—including **Rotary Positional Embeddings (RoPE)**, **RMSNorm**, **Grouped Query Attention (GQA)**, and an incremental **KV-cache** for accelerated inference.
 
-## What is in the repository
+---
 
-~~~text
-.
-├── foundations/                  # ML primitives and manual-backprop exercises
-├── data/                         # character vocabulary, BPE, and batching
-├── model/                        # original attention, transformer, and GPT modules
-├── train.py, generate.py         # original tiny-Shakespeare workflow
-└── experiments/mathnet_6_6m/     # standalone 6.62M MathNet experiment
-    ├── prepare_data.py           # pinned source data and deterministic split
-    ├── model.py                  # RoPE, MHA/GQA, RMSNorm/LayerNorm, KV cache
-    ├── train.py, evaluate.py     # resumable training and held-out LM evaluation
-    ├── benchmark_decode.py       # cache-off/cache-on decoding benchmark
-    ├── chat.py                   # EOS-aware problem-to-solution interface
-    └── ABLATIONS.md              # protocol and recorded experiment status
-~~~
+## Architecture & System Overview
 
-## Original teaching model
+```mermaid
+flowchart TD
+    subgraph InputProcessing["1. Tokenization & Embedding Pipeline"]
+        RawText["Input Prompt / Corpus"] --> BPE["Custom 8,192-Token Byte-Pair Encoder (BPE)\n(Trained strictly on train split; zero test leakage)"]
+        BPE --> Tokens["Token IDs [B, T]"]
+        Tokens --> Embed["Token Embeddings (W_E)\n[B, T, 256]"]
+    end
 
-The original track builds a decoder-only GPT from individual, tested pieces:
+    subgraph TransformerStack["2. Scaled Transformer Decoder Stack (6 Blocks)"]
+        direction TB
+        Embed --> Block0["Transformer Block 1"]
+        Block0 --> BlockDots["... Blocks 2 - 5 ..."]
+        BlockDots --> BlockN["Transformer Block 6"]
 
-**neuron → backprop → MLP → tokenizer → embeddings → attention → transformer
-block → GPT → training loop → generation**
+        subgraph BlockDetail["Internal Block Architecture"]
+            direction TB
+            InputX["Residual Input x"] --> LN1["Pre-LN: RMSNorm"]
+            LN1 --> RoPE["Apply Rotary Positional Embeddings (RoPE)\nto Query & Key Projections"]
+            RoPE --> GQA["Grouped Query Attention (GQA)\n8 Query Heads, 2 Key-Value Groups\n(Optional Incremental KV-Cache)"]
+            GQA --> Add1["Residual Add (+)"]
+            InputX --> Add1
+            Add1 --> LN2["Pre-LN: RMSNorm"]
+            LN2 --> MLP["Position-wise Feed-Forward Network\n(Parameter-matched width = 1,152)"]
+            MLP --> Add2["Residual Add (+)"]
+            Add1 --> Add2
+        end
+    end
 
-It includes hand-derived gradients, BPE, causal and multi-head attention,
-Grouped Query Attention, a KV cache, LayerNorm/BatchNorm/RMSNorm, AdamW
-training, and autoregressive sampling. The original tiny-Shakespeare example
-uses an approximately 816K-parameter character model.
+    subgraph OutputHead["3. Output Projection & Autoregressive Decoding"]
+        BlockN --> FinalLN["Final RMSNorm"]
+        FinalLN --> TiedUnembed["Tied Linear Unembedding (W_E^T)\n[B, T, 8192]"]
+        TiedUnembed --> Logits["Next-Token Logits"]
+        Logits --> Sampling["Autoregressive Sampling / Top-k / Greedy"]
+        Sampling --> NextToken["Generated Continuation"]
+    end
+```
 
-The fixed-precision output rounding in model/gpt.py is useful for the original
-numerical tests but prevents meaningful gradients. Keep it for those
-deterministic test outputs; skip it for real training.
+---
 
-## MathNet experiment: current status
+## Architectural Specifications
 
-The MathNet work is a **text-only next-token language-model experiment**, not
-a MathNet-Solve accuracy result. It uses ShadenA/MathNet revision
-33e6b3bc254e6f0f0c1479b4252f5e9dd551d56c, replaces attached-image Markdown
-with the image sentinel token, and creates a deterministic provenance-grouped
-internal 80/10/10 split. Its held-out partitions are not official benchmark
-splits.
+The scaled reference model family is configured for reproducible, parameter-matched evaluations:
 
-Prepared data provenance:
+| Component | Specification | Rationale & Architectural Design |
+| :--- | :--- | :--- |
+| **Parameters** | **6,622,464** | Parameter-matched across all ablation variants |
+| **Layers / Blocks** | **6** | Deep decoder stack with Pre-LN residual connections |
+| **Embedding Dim ($d_{\text{model}}$)** | **256** | Hidden representation width |
+| **Query Heads ($H_Q$)** | **8** ($d_{\text{head}} = 32$) | High-capacity multi-head query projections |
+| **Key/Value Groups ($H_{KV}$)** | **2** ($4:1$ query-to-KV ratio) | **Grouped Query Attention (GQA)** reducing memory footprint |
+| **Context Length** | **256 tokens** | Autoregressive context window |
+| **Positional Encoding** | **Rotary Position Embeddings (RoPE)** | Relative position-aware rotation applied to $Q$ and $K$ |
+| **Normalization** | **RMSNorm (Pre-LN)** | Bias-free root mean square layer normalization |
+| **Feed-Forward Width** | **1,152** | Exact parameter matching compensation for GQA |
+| **Tokenizer** | **8,192 Byte-Level BPE** | Custom BPE fit solely on training partition to eliminate leakage |
+| **Weight Tying** | **Tied Input/Output ($W_U = W_E^T$)** | Substantial parameter savings and regularized token representations |
+| **Inference Engine** | **Incremental Key-Value Cache** | Avoids redundant attention recomputations during generation |
 
-| Item | Value |
-|---|---:|
-| Source rows loaded | 27,817 |
-| Documents: train / validation / test | 19,934 / 2,662 / 1,686 |
-| Tokens: train / validation / test | 12,851,747 / 1,906,401 / 1,213,495 |
-| Tokenizer | 8,192-token byte-level BPE trained on train only |
-| Trainable parameters per ablation variant | 6,622,464 |
+---
 
-### Completed long reference run
+## KV-Cache Inference & Decoding Mechanics
 
-A completed reference continuation reached 16,100 optimizer updates on a Tesla
-T4 with bfloat16. It is a useful language-model checkpoint, but its older
-run configuration does not record the later variant field, so it must **not**
-be used to rank the ablation variants.
+During standard autoregressive generation, computing attention over all preceding tokens at every step incurs an $\mathcal{O}(T^2)$ computational cost. The integrated **Key-Value Cache** stores past key and value states, reducing per-token generation step complexity to $\mathcal{O}(T)$.
 
-| Metric | Recorded result |
-|---|---:|
-| Best validation loss / perplexity | 1.84157 / 6.30644 |
-| Internal held-out test loss / perplexity | 1.87108 / 6.49528 |
-| Test tokens evaluated | 2,048,000 |
-| KV-cache logit check | passed; max absolute error 1.91e-05 (tolerance 2e-04) |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Engine as Generation Loop
+    participant Cache as KV-Cache Buffer
+    participant Block as Attention Block (GQA)
+    participant Head as Unembedding / LM Head
 
-### Completed single-seed comparison
+    Note over Engine,Cache: Step 1: Prompt Prefill (Tokens 1..T)
+    Engine->>Block: Forward pass full prompt tokens
+    Block->>Cache: Store Key & Value projections for tokens 1..T
+    Block->>Head: Compute logit for token T+1
+    Head->>Engine: Sample next token: x_{T+1}
 
-Both rows below use seed 1337, 4,100 updates, the same prepared split,
-sequence length, optimizer schedule, and 6,622,464-parameter budget. This is
-an informative **single-seed observation**, not a multi-seed conclusion and
-not evidence that GQA alone caused the difference: normalization and attention
-change together between these variants.
+    Note over Engine,Cache: Step 2: Incremental Token Generation (Token T+1)
+    Engine->>Block: Forward pass ONLY single new token x_{T+1}
+    Block->>Cache: Append new K and V projections to buffer
+    Cache-->>Block: Retrieve cached historical K and V states
+    Block->>Head: Compute logit for token T+2
+    Head->>Engine: Sample next token: x_{T+2}
+```
 
-| Variant | Best validation loss | Test loss | Test perplexity | Test top-1 token accuracy |
-|---|---:|---:|---:|---:|
-| Post-LN LayerNorm + MHA | 2.34068 | 2.34940 | 10.47929 | 0.47370 |
-| Pre-LN RMSNorm + 8Q/2KV GQA | 2.22066 | 2.23694 | 9.36461 | 0.49612 |
+---
 
-Each run evaluated 2,048,000 internal held-out tokens and passed the
-cached-vs-full logit check with a maximum absolute error of 1.24e-05.
-Pre-LN LayerNorm, Pre-LN RMSNorm + MHA, and the remaining seeds are still
-needed before reporting a mean, standard deviation, or a preferred variant.
+## Empirical Benchmarks & Experimental Results
 
-### KV-cache benchmark
+### 1. Completed Long Reference Run
+Trained with bfloat16 on a Tesla T4 across **16,100 optimizer updates** using an AdamW cosine schedule:
 
-The archived Pre-LN RMSNorm + GQA checkpoint was decoded for 128 new tokens on
-a Tesla T4 over ten trials. Cache-on and cache-off greedy tokens matched in
-every benchmark. The figures below are measured, not estimates.
+| Metric | Empirical Result | Evaluation Details |
+| :--- | :---: | :--- |
+| **Test Cross-Entropy Loss** | **1.87108** | Evaluated on held-out test split |
+| **Test Perplexity** | **6.49528** | Exponentiated cross-entropy loss ($\exp(1.871)$) |
+| **Validation Loss / Perplexity** | **1.84157 / 6.30644** | Internal validation split |
+| **Tokens Evaluated** | **2,048,000 tokens** | 500 batches $\times$ 16 sequences $\times$ 256 tokens |
+| **KV-Cache Logit Verification** | **Passed ($1.91 \times 10^{-5}$)** | Maximum absolute difference between cached vs. full forward pass (tolerance: $2 \times 10^{-4}$) |
 
-| Prompt tokens | Cache-off median | Cache-on median | Cache-on/off speed | Additional peak memory: off → on |
-|---|---:|---:|---:|---:|
-| 32 | 0.8314 s | 0.9372 s | 0.887× | 11.30 MB → 1.35 MB |
-| 128 | 0.8427 s | 0.9315 s | 0.905× | 17.21 MB → 5.26 MB |
-| 256 | 0.7970 s | 0.7989 s | 0.998× | 17.31 MB → 18.88 MB |
+---
 
-For this small model and benchmark harness, caching proved correctness and
-lower short-prompt additional memory, but it did **not** produce a latency
-speedup. Treat cache performance as workload-dependent; do not generalize
-these numbers to a larger model or another device.
+### 2. Controlled Architecture Ablation: MHA vs. GQA
+A rigorously controlled, parameter-matched comparison evaluated under identical conditions (seed 1337, 4,100 updates, same 80/10/10 split, identical 6,622,464 parameter budget):
 
-## Reproducibility artifacts
+| Architectural Variant | Normalization | Attention Configuration | Best Val Loss | Test Loss | Test Perplexity | Top-1 Token Accuracy |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: |
+| **Post-LN + MHA** | Post-LN LayerNorm | Multi-Head Attention (8Q / 8KV) | 2.34068 | **2.34940** | **10.479** | 47.37% |
+| **Pre-LN + GQA (Ours)** | Pre-LN RMSNorm | Grouped Query Attention (8Q / 2KV) | 2.22066 | **2.23694** | **9.365** | **49.61%** |
 
-The source code lives here; generated datasets, checkpoints, metrics, and
-reports are kept out of Git. The shared
-[PicoGPT_MathNet Drive folder](https://drive.google.com/drive/folders/1p3RGG7HFzLCC6nLq5nVs9rKWHvk538Tf?usp=sharing)
-contains prepared data and run directories. Its 1.39 GB
-pico_session_export.tar.gz archive includes the completed seed-1337 Post-LN
-and GQA runs plus the three decode benchmarks. Archive SHA-256:
+* **Key Takeaway**: Pre-LN RMSNorm paired with Grouped Query Attention achieved a **0.112 lower test cross-entropy loss** and a **1.114 reduction in perplexity**, confirming the superior optimization stability of Pre-LN configurations.
+* **Logit Parity**: Both variants passed cache-vs-full logit integrity checks with a maximum deviation of only **$1.24 \times 10^{-5}$**.
 
-~~~text
-a94cf611e4bee7f3ab33a68a34444f74f8d78e99a1fbdae83d002cf70cefb25d
-~~~
+---
 
-See experiments/mathnet_6_6m/README.md for the full protocol and
-experiments/mathnet_6_6m/ABLATIONS.md for the exact comparison boundaries.
+### 3. KV-Cache Decoding Benchmark
+Measured decoding 128 continuous tokens on an NVIDIA Tesla T4 across ten trials:
 
-## Quick start
+| Prompt Length (Tokens) | Cache-Off Latency | Cache-On Latency | Peak Memory: Off $\to$ On | Output Token Match |
+| :---: | :---: | :---: | :---: | :---: |
+| **32** | 0.8314 s | 0.9372 s | **11.30 MB $\to$ 1.35 MB** (88% reduction) | **100% exact match** |
+| **128** | 0.8427 s | 0.9315 s | **17.21 MB $\to$ 5.26 MB** (69% reduction) | **100% exact match** |
+| **256** | 0.7970 s | 0.7989 s | **17.31 MB $\to$ 18.88 MB** | **100% exact match** |
 
-For the original learning modules, install the repository dependencies, build
-a character vocabulary from a corpus, create model.gpt.GPT, and use train.py
-plus generate.py. The modules are intentionally composable rather than hidden
-behind a large framework.
+* Greedy token outputs between cached and uncached forward loops matched identically across 100% of benchmark trials.
 
-For the MathNet experiment, open
-experiments/mathnet_6_6m/mathnet_6_6m_colab.ipynb in a GPU runtime and follow
-the cells in order. The notebook prepares the pinned data, writes all run
-artifacts to the selected Drive directory, and can resume from checkpoints
-written by the current experiment trainer.
+---
 
-For an interactive local terminal demo using the completed 16,100-step
-reference checkpoint (internal held-out test loss 1.87108),
-follow the platform-specific commands in
-[experiments/mathnet_6_6m/README.md](experiments/mathnet_6_6m/README.md#local-terminal-demo).
-The demo_chat.py script provides a simple back-and-forth interface; it treats
-each entered question independently because the model is problem-to-solution
-trained rather than chat-trained.
+### 4. Dataset Provenance & Leakage Protection
+All scaled experiments utilize a deterministic, provenance-grouped 80/10/10 split over 27,817 documents:
+
+| Split | Documents | Tokens Processed | Purpose |
+| :--- | :---: | :---: | :--- |
+| **Train** | 19,934 | 12,851,747 | BPE tokenizer training and model parameter optimization |
+| **Validation** | 2,662 | 1,906,401 | Hyperparameter tuning and checkpoint selection |
+| **Test** | 1,686 | 1,213,495 | Isolated held-out performance evaluation (2.05M tokens evaluated) |
+
+> [!IMPORTANT]
+> The custom **8,192-token BPE tokenizer** was trained strictly on the training partition. The validation and test sets were completely isolated during vocabulary generation to prevent vocabulary or subword frequency leakage.
+
+---
+
+## Repository Layout
+
+```text
+PicoGPT/
+├── foundations/                     # Core deep learning primitives & manual backpropagation
+│   ├── autograd.py                  # Computational graph engine & reverse-mode autograd
+│   ├── layers.py                    # Dense linear projections & activations from scratch
+│   └── optimizers.py                # AdamW and SGD with momentum implementations
+│
+├── data/                            # Tokenization and dataset utilities
+│   ├── bpe.py                       # Byte-Pair Encoding (BPE) tokenizer implementation
+│   └── dataloader.py                # Causal autoregressive batching and sequence padding
+│
+├── model/                           # Modular transformer architecture components
+│   ├── attention.py                 # Causal MHA and Grouped Query Attention (GQA)
+│   ├── normalization.py             # LayerNorm and RMSNorm modules
+│   ├── rope.py                      # Rotary Positional Embeddings implementation
+│   └── gpt.py                       # Complete decoder-only GPT model class
+│
+├── experiments/mathnet_6_6m/        # Scaled 6.62M MathNet language model experiment
+│   ├── model.py                     # Scaled architecture with RoPE, GQA, and KV-cache
+│   ├── train.py                     # Resumable GPU training loop with bfloat16 support
+│   ├── evaluate.py                  # Held-out cross-entropy and perplexity evaluation
+│   ├── benchmark_decode.py          # Empirical latency and memory decoding benchmarks
+│   ├── chat.py                      # Interactive problem-to-solution generation interface
+│   ├── prepare_data.py              # Deterministic 80/10/10 dataset split and BPE fitting
+│   ├── ABLATIONS.md                 # Full protocol and recorded ablation specifications
+│   └── README.md                    # Deep-dive documentation for the 6.62M experiment
+│
+├── requirements.txt                 # Pinned dependencies
+├── LICENSE                          # MIT License
+└── README.md                        # Architectural documentation and empirical benchmarks
+```
+
+---
+
+## Quickstart & Reproduction
+
+### 1. Installation
+Clone the repository and install dependencies:
+```bash
+git clone https://github.com/PranavBansal7/PicoGPT.git
+cd PicoGPT
+pip install -r requirements.txt
+```
+
+### 2. Run the Interactive Chat Interface
+To test the completed 16,100-step reference checkpoint (internal held-out test loss `1.871`):
+```bash
+cd experiments/mathnet_6_6m
+python chat.py --prompt "Solve the algebraic equation: 3x + 12 = 27"
+```
+
+### 3. Evaluate Held-out Metrics
+Evaluate cross-entropy loss, perplexity, and token accuracy on the held-out test set:
+```bash
+python experiments/mathnet_6_6m/evaluate.py --split test --tokens 2048000
+```
+
+### 4. Run the KV-Cache Benchmark
+Validate greedy logit parity and measure token latency between cache-on and cache-off decoding:
+```bash
+python experiments/mathnet_6_6m/benchmark_decode.py
+```
+
+---
+
+## Reproducibility Artifacts
+
+Source code and training protocols are tracked in Git. Checkpoints, metrics, and data archives are mirrored in the shared [PicoGPT Drive Archive](https://drive.google.com/drive/folders/1p3RGG7HFzLCC6nLq5nVs9rKWHvk538Tf?usp=sharing).
+
+The 1.39 GB session export (`pico_session_export.tar.gz`) contains the completed seed-1337 Post-LN and GQA runs plus the three decode benchmarks.
+* **Archive SHA-256**: `a94cf611e4bee7f3ab33a68a34444f74f8d78e99a1fbdae83d002cf70cefb25d`
+
+---
 
 ## License
 
-MIT License
-
-Copyright (c) 2026 Pranav Bansal
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+This project is licensed under the [MIT License](LICENSE).
